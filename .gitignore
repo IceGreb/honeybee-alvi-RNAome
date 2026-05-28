@@ -1,0 +1,14 @@
+# Nextflow tracking & logs
+.nextflow/
+.nextflow.log*
+work/
+
+# Ignore actual data and massive outputs
+data/raw/
+data/processed/
+results/rnaseq_outputs/
+results/metagenomics_outputs/
+
+# OS clutter
+.DS_Store
+EOF
