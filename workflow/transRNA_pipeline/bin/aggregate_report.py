@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+aggregate_report.py
+────────────────────
+Column sources (in report order):
+  Raw reads                              <- raw seqkit stats (mate1)
+  Trimmed                                <- trimmed seqkit stats (mate1)
+  STAR mapped %                          <- Log.final.out (unique + multi-mapped %)
+  STAR unmapped                          <- star_unmapped seqkit stats (mate1)
+  Decon-a: Host+Human matched %         <- (trimmed - host_survivors) / trimmed * 100
+  Decon-b: 12 viral matched %           <- (host - virus_survivors) / host * 100
+  MAGs matched %                         <- (virus - mags_survivors) / virus * 100
+  Candidate transRNAs total reads        <- mags_survivors (reads going downstream)
+  Kraken classified %                    <- kraken C-reads / trimmed_both_mates * 100
+  BLAST classified %                     <- blast unique queries / trimmed_both_mates * 100
+  Classified total %                     <- sum of above two
+  Total transRNAs after all filters      <- merged_reads (pre-dedup pool) / trimmed_both * 100
+  Transmissible RNA representative seqs  <- ge5_groups / total_groups * 100
+"""
+
+import glob
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import pandas as pd
+
+SEQKIT_PATTERNS = {
+    "raw":          re.compile(r"^(.+)_raw_stats\.tsv$"),
+    "trimmed":      re.compile(r"^(.+)_trimmed_stats\.tsv$"),
+    "star_unmapped":re.compile(r"^(.+)_star_unmapped_stats\.tsv$"),
+    "host":         re.compile(r"^(.+)_bbsplit_host_stats\.tsv$"),
+    "virus":        re.compile(r"^(.+)_bbsplit_virus_stats\.tsv$"),
+    "mags":         re.compile(r"^(.+)_noMAGs_stats\.tsv$"),
+}
+COLLAPSE_RE = re.compile(r"^(.+)_collapse_stats\.tsv$")
+WIDS_RE     = re.compile(r"^(.+)_ge5_detected_weighted_ids\.tsv$")
+STARLOG_RE  = re.compile(r"^(.+)_Log\.final\.out$")
+MATE_RE     = re.compile(r"_[12]$")
+
+
+def infer_group(sample: str) -> str:
+    s = sample.upper()
+    if s.startswith("RJ"): return "RJ"
+    if s.startswith("T"):  return "ST"
+    return "unknown"
+
+
+def pct(numerator, denominator, decimals=2):
+    if denominator and denominator > 0:
+        return round(numerator / denominator * 100, decimals)
+    return 0.0
+
+
+def rpm(numerator, denominator, decimals=2):
+    if denominator and denominator > 0:
+        return round(numerator / denominator * 1_000_000, decimals)
+    return 0.0
+
+
+def seqkit_total_reads(path: Path) -> int:
+    """Return total read count across all rows (both mates) from a seqkit stats TSV."""
+    try:
+        df = pd.read_csv(path, sep="\t")
+        return int(df["num_seqs"].sum())
+    except Exception as e:
+        print(f"Warning seqkit {path}: {e}", file=sys.stderr)
+        return 0
+
+
+def parse_star_log(path: Path) -> float:
+    """Return total mapped % (unique + multi-mapped) from STAR Log.final.out."""
+    unique_pct = 0.0
+    multi_pct  = 0.0
+    try:
+        with path.open() as f:
+            for line in f:
+                if "Uniquely mapped reads %" in line:
+                    unique_pct = float(line.split("|")[1].strip().rstrip("%"))
+                elif "% of reads mapped to multiple loci" in line:
+                    multi_pct  = float(line.split("|")[1].strip().rstrip("%"))
+    except Exception as e:
+        print(f"Warning STAR log {path}: {e}", file=sys.stderr)
+    return round(unique_pct + multi_pct, 2)
+
+
+def weighted_total(path: Path) -> int:
+    total = 0
+    try:
+        with path.open() as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) >= 3:
+                    try:
+                        total += int(parts[2])
+                    except ValueError:
+                        pass
+    except Exception as e:
+        print(f"Warning wids {path}: {e}", file=sys.stderr)
+    return total
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--output",         required=True)
+    ap.add_argument("--summary-output", default="dataset_summary_report.tsv")
+    ap.add_argument("--virus-output",   default="virus_exclusion_report.tsv")
+    args = ap.parse_args()
+
+    seqkit_data     = defaultdict(dict)
+    trimmed_both    = {}   # total reads both mates (denominator for % columns)
+    star_mapped_pct = {}
+    collapse_total  = {}
+    collapse_ge5    = {}
+    merged_reads    = {}   # reads in merged.fq before rmdup
+    kraken_counts   = defaultdict(int)
+    blast_unique    = defaultdict(int)
+    final_trans     = defaultdict(int)
+    all_samples     = set()
+    virus_rows      = []
+
+    # ── seqkit stats (all counts use both-mate totals for consistency) ────────
+    for fname in sorted(glob.glob("*.tsv")):
+        for step, pattern in SEQKIT_PATTERNS.items():
+            m = pattern.match(fname)
+            if m:
+                sample = m.group(1)
+                all_samples.add(sample)
+                seqkit_data[sample][step] = seqkit_total_reads(Path(fname))
+                if step == "trimmed":
+                    trimmed_both[sample] = seqkit_total_reads(Path(fname))
+                break
+
+    # ── STAR Log.final.out → mapped % ────────────────────────────────────────
+    for fname in sorted(glob.glob("*_Log.final.out")):
+        m = STARLOG_RE.match(fname)
+        if m:
+            sample = m.group(1)
+            all_samples.add(sample)
+            star_mapped_pct[sample] = parse_star_log(Path(fname))
+
+    # ── collapse stats ────────────────────────────────────────────────────────
+    for fname in sorted(glob.glob("*_collapse_stats.tsv")):
+        m = COLLAPSE_RE.match(fname)
+        if m:
+            sample = m.group(1)
+            all_samples.add(sample)
+            try:
+                df = pd.read_csv(fname, sep="\t")
+                row = df[df["mate"].astype(str) == "1"]
+                if not row.empty:
+                    merged_reads[sample]   = int(row["merged_reads"].iloc[0])
+                    collapse_total[sample] = int(row["total_groups"].iloc[0])
+                    collapse_ge5[sample]   = int(row["ge5_groups"].iloc[0])
+            except Exception as e:
+                print(f"Warning collapse {fname}: {e}", file=sys.stderr)
+
+    # ── filter stats: kraken + blast unique queries + virus exclusions ────────
+    for fname in sorted(glob.glob("*_filter_stats.tsv")):
+        try:
+            df_s = pd.read_csv(fname, sep="\t")
+            for _, row in df_s.iterrows():
+                raw_sample = str(row.get("sample", "")).strip()
+                tool       = str(row.get("tool",   "")).strip()
+                rm_v       = row.get("rm_virus", 0)
+
+                if tool == "kraken":
+                    sample = raw_sample
+                    all_samples.add(sample)
+                    kraken_counts[sample] += int(row.get("classified", 0))
+                elif tool == "blast":
+                    # Blast filter_stats sample field is "RJ1_1" / "RJ1_2";
+                    # strip mate suffix to match the base sample name.
+                    sample = MATE_RE.sub("", raw_sample)
+                    all_samples.add(sample)
+                    blast_unique[sample] += int(row.get("unique_queries", 0))
+
+                virus_rows.append({
+                    "Dataset": infer_group(raw_sample),
+                    "Sample":  raw_sample,
+                    "Tool":    tool,
+                    "Virus reads excluded": rm_v,
+                })
+        except Exception as e:
+            print(f"Warning filter stats {fname}: {e}", file=sys.stderr)
+
+    # ── weighted_ids: reinflated transRNA total (informational) ───────────────
+    for fname in sorted(glob.glob("*_ge5_detected_weighted_ids.tsv")):
+        m = WIDS_RE.match(fname)
+        if m:
+            sample = m.group(1)
+            all_samples.add(sample)
+            final_trans[sample] += weighted_total(Path(fname))
+
+    # ── Build main report ─────────────────────────────────────────────────────
+    rows = []
+    for sample in sorted(all_samples):
+        sd       = seqkit_data.get(sample, {})
+        raw      = sd.get("raw",           0)
+        trimmed  = sd.get("trimmed",       0)  # both mates total
+        t_both   = trimmed_both.get(sample, trimmed)
+        unmapped = sd.get("star_unmapped", 0)
+        host     = sd.get("host",  0)
+        virus    = sd.get("virus", 0)
+        mags     = sd.get("mags",  0)
+        krak     = kraken_counts.get(sample, 0)
+        blast    = blast_unique.get(sample,  0)
+        c_total  = collapse_total.get(sample, 0)
+        c_ge5    = collapse_ge5.get(sample,   0)
+        mreads   = merged_reads.get(sample,   0)
+
+        rows.append({
+            "Sample":                                        sample,
+            "Group":                                         infer_group(sample),
+            "Raw reads":                                     raw,
+            "Trimmed":                                       trimmed,
+            "STAR mapped %":                                 star_mapped_pct.get(sample, 0.0),
+            "STAR unmapped":                                 unmapped,
+            "Decon-a: Host+Human matched %":                 pct(unmapped - host, unmapped),
+            "Decon-b: 12 viral matched %":                   pct(host - virus, host),
+            "MAGs matched %":                                pct(virus - mags, virus),
+            "Candidate transRNAs total reads":               mags,
+            "Kraken classified %":                           pct(krak,         mags),
+            "BLAST classified %":                            pct(blast,        mags),
+            "Classified total %":                            pct(krak + blast, mags),
+            "Total transRNAs after all filters %":            pct(mreads, t_both),
+            "Total transRNAs after all filters (RPM)":        rpm(mreads, t_both),
+            "Transmissible RNA representative sequences %":   pct(c_ge5,  t_both),
+            "Transmissible RNA representative sequences (RPM)": rpm(c_ge5, t_both),
+        })
+
+    df = pd.DataFrame(rows)
+    df.drop(columns=["Group"]).to_csv(args.output, sep="\t", index=False)
+    print(f"Report: {args.output} ({len(df)} samples)", file=sys.stderr)
+
+    # ── Dataset summary ───────────────────────────────────────────────────────
+    summary_rows = []
+    for grp in ["RJ", "ST"]:
+        sub = df[df["Group"] == grp]
+        if sub.empty:
+            continue
+        trimmed_tot = sub["Trimmed"].sum()
+        summary_rows.append({
+            "Dataset":                                       grp,
+            "n_samples":                                     len(sub),
+            "Trimmed (both mates total)":                     int(trimmed_tot),
+            "Avg STAR mapped %":                             round(sub["STAR mapped %"].mean(), 2),
+            "Avg Decon-a matched %":                         round(sub["Decon-a: Host+Human matched %"].mean(), 2),
+            "Avg Decon-b matched %":                         round(sub["Decon-b: 12 viral matched %"].mean(), 2),
+            "Avg MAGs matched %":                            round(sub["MAGs matched %"].mean(), 2),
+            "Avg Kraken classified %":                       round(sub["Kraken classified %"].mean(), 2),
+            "Avg BLAST classified %":                        round(sub["BLAST classified %"].mean(), 2),
+            "Avg Classified total %":                        round(sub["Classified total %"].mean(), 2),
+            "Avg Total transRNAs after all filters %":           round(sub["Total transRNAs after all filters %"].mean(), 2),
+            "Avg Total transRNAs after all filters (RPM)":       round(sub["Total transRNAs after all filters (RPM)"].mean(), 2),
+            "Avg Transmissible RNA representative seqs %":       round(sub["Transmissible RNA representative sequences %"].mean(), 2),
+            "Avg Transmissible RNA representative seqs (RPM)":   round(sub["Transmissible RNA representative sequences (RPM)"].mean(), 2),
+        })
+    pd.DataFrame(summary_rows).to_csv(args.summary_output, sep="\t", index=False)
+    print(f"Summary: {args.summary_output}", file=sys.stderr)
+
+    # ── Virus exclusion report ────────────────────────────────────────────────
+    if virus_rows:
+        pd.DataFrame(virus_rows).to_csv(args.virus_output, sep="\t", index=False)
+        print(f"Virus report: {args.virus_output}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
