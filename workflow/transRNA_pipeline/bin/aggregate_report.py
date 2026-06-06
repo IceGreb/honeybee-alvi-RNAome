@@ -2,20 +2,30 @@
 """
 aggregate_report.py
 ────────────────────
-Column sources (in report order):
-  Raw reads                              <- raw seqkit stats (mate1)
-  Trimmed                                <- trimmed seqkit stats (mate1)
-  STAR mapped %                          <- Log.final.out (unique + multi-mapped %)
-  STAR unmapped                          <- star_unmapped seqkit stats (mate1)
-  Decon-a: Host+Human matched %         <- (trimmed - host_survivors) / trimmed * 100
-  Decon-b: 12 viral matched %           <- (host - virus_survivors) / host * 100
-  MAGs matched %                         <- (virus - mags_survivors) / virus * 100
-  Candidate transRNAs total reads        <- mags_survivors (reads going downstream)
-  Kraken classified %                    <- kraken C-reads / trimmed_both_mates * 100
-  BLAST classified %                     <- blast unique queries / trimmed_both_mates * 100
-  Classified total %                     <- sum of above two
-  Total transRNAs after all filters      <- merged_reads (pre-dedup pool) / trimmed_both * 100
-  Transmissible RNA representative seqs  <- ge5_groups / total_groups * 100
+Produces pipeline_read_counts_report.tsv, dataset_summary_report.tsv,
+and virus_exclusion_report.tsv from staged pipeline output files.
+
+Column sources (per sample, in report order):
+  Raw reads                                <- raw seqkit stats (both mates summed)
+  Trimmed                                  <- trimmed seqkit stats (both mates summed)
+  STAR mapped %                            <- Log.final.out (unique + multi-mapped %)
+  STAR unmapped                            <- star_unmapped seqkit stats (both mates)
+  Decon-a: Host+Human matched %            <- (STAR_unmapped - host_survivors) / STAR_unmapped * 100
+  Decon-b: 12 viral matched %              <- (host_survivors - virus_survivors) / host_survivors * 100
+  MAGs matched %                           <- (virus_survivors - mags_survivors) / virus_survivors * 100
+  Candidate transRNAs total reads          <- mags_survivors (reads entering BLAST/Kraken)
+  Kraken classified %                      <- kraken C-reads / mags_survivors * 100
+  BLAST classified %                       <- blast unique query IDs / (mags_survivors - kraken_classified_reads) * 100
+                                              denominator = Kraken-unclassified individual reads passed to BLAST
+                                              (kraken counts doubled at ingestion: pairs → individual reads)
+  Classified total %                       <- sum of above two
+  Total transRNAs after all filters %      <- merged_reads / t_both * 100
+                                              merged_reads = reads in blast+kraken pool before dedup
+  Total transRNAs after all filters (RPM)  <- merged_reads / t_both * 1e6
+  Transmissible RNA representative seqs %  <- reinflated_ge5 / t_both * 100
+                                              reinflated_ge5 = sum of dup weights for >=5-dup sequences
+  Transmissible RNA representative seqs (RPM) <- reinflated_ge5 / t_both * 1e6
+  % of transRNAs with >=5 duplicates       <- reinflated_ge5 / merged_reads * 100
 """
 
 import glob
@@ -169,7 +179,9 @@ def main():
                 if tool == "kraken":
                     sample = raw_sample
                     all_samples.add(sample)
-                    kraken_counts[sample] += int(row.get("classified", 0))
+                    # Each Kraken line = 1 read pair; ×2 converts to individual reads
+                    # to match mags (seqkit, both mates) and blast (unique_queries per mate).
+                    kraken_counts[sample] += int(row.get("classified", 0)) * 2
                 elif tool == "blast":
                     # Blast filter_stats sample field is "RJ1_1" / "RJ1_2";
                     # strip mate suffix to match the base sample name.
@@ -207,9 +219,10 @@ def main():
         mags     = sd.get("mags",  0)
         krak     = kraken_counts.get(sample, 0)
         blast    = blast_unique.get(sample,  0)
-        c_total  = collapse_total.get(sample, 0)
-        c_ge5    = collapse_ge5.get(sample,   0)
-        mreads   = merged_reads.get(sample,   0)
+        c_total    = collapse_total.get(sample, 0)
+        c_ge5      = collapse_ge5.get(sample,   0)
+        mreads     = merged_reads.get(sample,   0)
+        reinflated = final_trans.get(sample,    0)
 
         rows.append({
             "Sample":                                        sample,
@@ -221,14 +234,20 @@ def main():
             "Decon-a: Host+Human matched %":                 pct(unmapped - host, unmapped),
             "Decon-b: 12 viral matched %":                   pct(host - virus, host),
             "MAGs matched %":                                pct(virus - mags, virus),
+            # All three variables are in individual-read units:
+            # mags  : seqkit stats on *_noMAGs_stats.tsv (both mates summed)
+            # krak  : *_kraken_filter_stats.tsv → 'classified' × 2  (pairs converted to reads at ingestion)
+            # blast : *_blast_filter_stats.tsv → 'unique_queries' mate1 + mate2
+            # mags - krak = Kraken-unclassified individual reads passed to BLAST
             "Candidate transRNAs total reads":               mags,
             "Kraken classified %":                           pct(krak,         mags),
-            "BLAST classified %":                            pct(blast,        mags),
+            "BLAST classified %":                            pct(blast,        mags - krak),
             "Classified total %":                            pct(krak + blast, mags),
-            "Total transRNAs after all filters %":            pct(mreads, t_both),
-            "Total transRNAs after all filters (RPM)":        rpm(mreads, t_both),
-            "Transmissible RNA representative sequences %":   pct(c_ge5,  t_both),
-            "Transmissible RNA representative sequences (RPM)": rpm(c_ge5, t_both),
+            "Total transRNAs after all filters %":               pct(mreads,     t_both),
+            "Total transRNAs after all filters (RPM)":           rpm(mreads,     t_both),
+            "Transmissible RNA representative sequences %":      pct(reinflated, t_both),
+            "Transmissible RNA representative sequences (RPM)":  rpm(reinflated, t_both),
+            "% of transRNAs with >=5 duplicates":               pct(reinflated, mreads),
         })
 
     df = pd.DataFrame(rows)
@@ -257,6 +276,7 @@ def main():
             "Avg Total transRNAs after all filters (RPM)":       round(sub["Total transRNAs after all filters (RPM)"].mean(), 2),
             "Avg Transmissible RNA representative seqs %":       round(sub["Transmissible RNA representative sequences %"].mean(), 2),
             "Avg Transmissible RNA representative seqs (RPM)":   round(sub["Transmissible RNA representative sequences (RPM)"].mean(), 2),
+            "Avg % of transRNAs with >=5 duplicates":            round(sub["% of transRNAs with >=5 duplicates"].mean(), 2),
         })
     pd.DataFrame(summary_rows).to_csv(args.summary_output, sep="\t", index=False)
     print(f"Summary: {args.summary_output}", file=sys.stderr)
