@@ -1,18 +1,16 @@
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
+*Manuscript in preparation.* Raw sequencing data and intermediate files will be made publicly available upon publication.
 
 This repository documents the steps used to process RNA-seq data from *Apis mellifera*
 and identify transmissible RNA candidates. Prior setup of tools and environments is
 required (see _Config_ and _Software requirements_ sections below). For questions or
-clarifications, contact Nikolaos Vergoulidis (nv358@cam.ac.uk). Intermediate files and
-figures are available through the accompanying [Zenodo](https://doi.org/10.5281/zenodo.XXXXXXX)
-repository. The code is provided for transparency and reproducibility of the analysis.
-Raw sequencing data will be deposited at NCBI SRA upon publication.
+clarifications, contact Nikolaos Vergoulidis (nv358@cam.ac.uk). The code is provided
+for transparency and reproducibility of the analysis.
 
 # Honeybee *Apis mellifera* Transmissible RNAome
 
 The aim of this repository is to document the steps used to process raw paired-end RNA-seq
 reads from Royal Jelly and systemic larval tissue samples and identify candidate transmissible
-RNA sequences. Pre-processing was carried out using nf-core/rnaseq and nf-core/mag. The custom
+RNA sequences. Part of the process was carried out using nf-core/rnaseq and nf-core/mag. The custom
 transRNA identification pipeline is implemented in Nextflow (DSL2) v1.2 and parallelized on
 the CSD3 icelake cluster at the University of Cambridge (kernel: Linux 4.18.0-553.125.1.el8_10.x86_64).
 Information about software versions and conda environments is found in the `config/` directory
@@ -40,25 +38,13 @@ The pipeline was parallelized on CSD3 using SLURM via the `cambridge.config` pro
 ### DNA sequencing
 
 For each sequenced DNA sample, two systemic larval DNA extracts were pooled to create a single
-DNA library. Library preparation and sequencing were conducted by Novogene using the Novogene
-NGS DNA Library Prep Set (Cat. No. PT004), in which DNA was randomly sheared into short fragments,
-end-repaired, dA-tailed, and ligated with Illumina adaptors. Libraries were sequenced on a
-NovaSeq X Plus.
+DNA library.
 
 ### RNA sequencing
 
-**Mid-RNAseq** — RNAs between 17 nt and 100 nt were purified through gel extraction prior to
-library preparation. Libraries were prepared using the NEB Next® Multiplex Small RNA Library
-Prep Set for Illumina® (Set 1, Cat. No. E7300) and sequenced on a NovaSeq X Plus. Library
-preparation and sequencing were conducted by Novogene.
-
-**RISC-seq** — Libraries were prepared using the NEXTFLEX® Small RNA-Seq Kit v4 with UDIs
-(Revvity). Library preparation and sequencing were conducted by the Cambridge Genomics Service,
-University of Cambridge.
-
-**RNAseq (differential expression)** — Libraries were prepared using the Novogene NGS Stranded
-RNA Library Prep Set (Cat. No. PT044) and sequenced on a NovaSeq X Plus. Library preparation
-and sequencing were conducted by Novogene.
+* **Mid-RNAseq** — Novogene
+* **RISC-seq** — Cambridge Genomics Service, University of Cambridge
+* **RNAseq (differential expression)** — Novogene
 
 ### Samples
 
